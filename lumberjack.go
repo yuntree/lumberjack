@@ -37,6 +37,7 @@ import (
 
 const (
 	backupTimeFormat = "2006-01-02T15-04-05.000"
+	backupSep        = "-"
 	compressSuffix   = ".gz"
 	defaultMaxSize   = 100
 )
@@ -107,6 +108,15 @@ type Logger struct {
 	// using gzip. The default is not to perform compression.
 	Compress bool `json:"compress" yaml:"compress"`
 
+	// BackupNameFunc function to get backup filename
+	BackupNameFunc func(name, sep, timeFmt string, local bool) string
+
+	// BackupTimeFormat backup file time format
+	BackupTimeFormat string `json:"backup_time_format" yaml:"backup_time_format"`
+
+	// BackupSep a separator, using in the filename and the timestamp
+	BackupSep string `json:"backup_sep" yaml:"backup_sep"`
+
 	size int64
 	file *os.File
 	mu   sync.Mutex
@@ -118,9 +128,6 @@ type Logger struct {
 var (
 	// currentTime exists so it can be mocked out by tests.
 	currentTime = time.Now
-
-	// os_Stat exists so it can be mocked out by tests.
-	osStat = os.Stat
 
 	// megabyte is the conversion factor between MaxSize and bytes.  It is a
 	// variable so tests can mock it out and not need to write megabytes of data
@@ -213,12 +220,17 @@ func (l *Logger) openNew() error {
 
 	name := l.filename()
 	mode := os.FileMode(0600)
-	info, err := osStat(name)
+	info, err := os.Stat(name)
 	if err == nil {
 		// Copy the mode off the old logfile.
 		mode = info.Mode()
+		sep := l.BackupSep
+		if sep == "" {
+			sep = backupSep
+		}
+		timeFmt := l.timeFormat()
 		// move the existing file
-		newname := backupName(name, l.LocalTime)
+		newname := l.backupName(name, sep, timeFmt, l.LocalTime)
 		if err := os.Rename(name, newname); err != nil {
 			return fmt.Errorf("can't rename log file: %s", err)
 		}
@@ -241,10 +253,29 @@ func (l *Logger) openNew() error {
 	return nil
 }
 
+// timeFormat return the time format
+func (l *Logger) timeFormat() string {
+	timeFmt := l.BackupTimeFormat
+	if timeFmt == "" {
+		timeFmt = backupTimeFormat
+	}
+	return timeFmt
+}
+
 // backupName creates a new filename from the given name, inserting a timestamp
 // between the filename and the extension, using the local time if requested
 // (otherwise UTC).
-func backupName(name string, local bool) string {
+func (l *Logger) backupName(name, sep, timeFmt string, local bool) string {
+	if l.BackupNameFunc == nil {
+		return backupName(name, sep, timeFmt, local)
+	}
+	return l.BackupNameFunc(name, sep, timeFmt, local)
+}
+
+// backupName creates a new filename from the given name, inserting a timestamp
+// between the filename and the extension, using the local time if requested
+// (otherwise UTC).
+func backupName(name, sep, timeFmt string, local bool) string {
 	dir := filepath.Dir(name)
 	filename := filepath.Base(name)
 	ext := filepath.Ext(filename)
@@ -253,9 +284,8 @@ func backupName(name string, local bool) string {
 	if !local {
 		t = t.UTC()
 	}
-
-	timestamp := t.Format(backupTimeFormat)
-	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
+	timestamp := t.Format(timeFmt)
+	return filepath.Join(dir, fmt.Sprintf("%s%s%s%s", prefix, sep, timestamp, ext))
 }
 
 // openExistingOrNew opens the logfile if it exists and if the current write
@@ -265,7 +295,7 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 	l.mill()
 
 	filename := l.filename()
-	info, err := osStat(filename)
+	info, err := os.Stat(filename)
 	if os.IsNotExist(err) {
 		return l.openNew()
 	}
@@ -410,6 +440,9 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 		if f.IsDir() {
 			continue
 		}
+		if f.Name() == filepath.Base(l.filename()) {
+			continue
+		}
 		if t, err := l.timeFromName(f.Name(), prefix, ext); err == nil {
 			logFiles = append(logFiles, logInfo{t, f})
 			continue
@@ -438,7 +471,9 @@ func (l *Logger) timeFromName(filename, prefix, ext string) (time.Time, error) {
 		return time.Time{}, errors.New("mismatched extension")
 	}
 	ts := filename[len(prefix) : len(filename)-len(ext)]
-	return time.Parse(backupTimeFormat, ts)
+
+	timeFmt := l.timeFormat()
+	return time.Parse(timeFmt, ts)
 }
 
 // max returns the maximum size in bytes of log files before rolling.
@@ -459,7 +494,11 @@ func (l *Logger) dir() string {
 func (l *Logger) prefixAndExt() (prefix, ext string) {
 	filename := filepath.Base(l.filename())
 	ext = filepath.Ext(filename)
-	prefix = filename[:len(filename)-len(ext)] + "-"
+	sep := l.BackupSep
+	if sep == "" {
+		sep = backupSep
+	}
+	prefix = filename[:len(filename)-len(ext)] + sep
 	return prefix, ext
 }
 
@@ -472,7 +511,7 @@ func compressLogFile(src, dst string) (err error) {
 	}
 	defer f.Close()
 
-	fi, err := osStat(src)
+	fi, err := os.Stat(src)
 	if err != nil {
 		return fmt.Errorf("failed to stat log file: %v", err)
 	}
